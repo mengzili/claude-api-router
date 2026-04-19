@@ -238,26 +238,26 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </details>
 
-  <details id="traffic" open>
-    <summary>Traffic<span class="sub" id="traffic-sub">requests per upstream, 10-minute buckets</span></summary>
+  <details id="routing" open>
+    <summary>Routing table<span class="sub">upstream APIs, by priority</span></summary>
     <div class="panel-body">
-      <div class="chart-head">
-        <span id="traffic-total" class="muted"></span>
-        <label class="window-select">
-          window
-          <select id="window-sel">
-            <option value="3600">1 hour</option>
-            <option value="14400" selected>4 hours</option>
-            <option value="43200">12 hours</option>
-            <option value="86400">24 hours</option>
-          </select>
-        </label>
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th style="width:60px">Pri</th>
+            <th style="width:18%">Name</th>
+            <th style="width:26%">Base URL</th>
+            <th style="width:12%">Credential</th>
+            <th style="width:22%">Secret</th>
+            <th style="width:12%">Status</th>
+            <th style="width:10%">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div id="empty" class="empty" style="display:none; margin-top: 12px;">
+        No entries yet. Click <b>+ Add row</b> in the toolbar to create one.
       </div>
-      <svg id="chart" class="chart-svg" viewBox="0 0 600 180" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"></svg>
-      <div id="chart-empty" class="chart-empty" style="display:none">
-        No traffic recorded yet. Point Claude Code at this router and send a prompt.
-      </div>
-      <div id="chart-legend" class="chart-legend"></div>
     </div>
   </details>
 
@@ -274,23 +274,26 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </details>
 
-  <table id="tbl">
-    <thead>
-      <tr>
-        <th style="width:60px">Pri</th>
-        <th style="width:18%">Name</th>
-        <th style="width:26%">Base URL</th>
-        <th style="width:12%">Credential</th>
-        <th style="width:22%">Secret</th>
-        <th style="width:12%">Status</th>
-        <th style="width:10%">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <div id="empty" class="empty" style="display:none; margin-top: 12px;">
-    No entries yet. Click <b>+ Add row</b> to create one.
-  </div>
+  <details id="traffic" open>
+    <summary>Traffic<span class="sub" id="traffic-sub">requests per upstream, hourly buckets</span></summary>
+    <div class="panel-body">
+      <div class="chart-head">
+        <span id="traffic-total" class="muted"></span>
+        <label class="window-select">
+          window
+          <select id="window-sel">
+            <option value="86400" selected>day</option>
+            <option value="604800">week</option>
+          </select>
+        </label>
+      </div>
+      <svg id="chart" class="chart-svg" viewBox="0 0 600 180" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="chart-empty" class="chart-empty" style="display:none">
+        No traffic recorded yet. Point Claude Code at this router and send a prompt.
+      </div>
+      <div id="chart-legend" class="chart-legend"></div>
+    </div>
+  </details>
 </main>
 
 <script>
@@ -607,10 +610,16 @@ function colorFor(name) {
   return _upstreamColors[name];
 }
 
-function fmtHM(epochSec) {
+function fmtTime(epochSec, windowSec) {
   const d = new Date(epochSec * 1000);
   const hh = String(d.getHours()).padStart(2, "0");
   const mm = String(d.getMinutes()).padStart(2, "0");
+  // For windows > 1 day, include month/day so labels disambiguate.
+  if (windowSec > 86400) {
+    const mo = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${mo}-${dd} ${hh}h`;
+  }
   return `${hh}:${mm}`;
 }
 
@@ -627,8 +636,11 @@ function renderChart(data) {
   const total = $("traffic-total");
   const sub   = $("traffic-sub");
   const bucketMin = Math.round(data.bucket_sec / 60);
-  const windowH  = (data.window_sec / 3600);
-  sub.textContent = `requests per upstream, ${bucketMin}-minute buckets, last ${windowH}h`;
+  const bucketLabel = bucketMin >= 60 ? `${Math.round(bucketMin/60)}-hour` : `${bucketMin}-minute`;
+  const windowLabel = data.window_sec >= 86400
+    ? `${Math.round(data.window_sec / 86400)} day${data.window_sec > 86400 ? "s" : ""}`
+    : `${Math.round(data.window_sec / 3600)}h`;
+  sub.textContent = `requests per upstream, ${bucketLabel} buckets, last ${windowLabel}`;
 
   if (grandTotal === 0 || names.length === 0) {
     chart.innerHTML = "";
@@ -666,7 +678,7 @@ function renderChart(data) {
   // Stacked bars
   for (let i = 0; i < n; i++) {
     let yTop = PAD.top + innerH;
-    let tip = `${fmtHM(buckets[i])}`;
+    let tip = `${fmtTime(buckets[i], data.window_sec)}`;
     for (const name of names) {
       const v = series[name][i];
       if (v === 0) continue;
@@ -690,7 +702,7 @@ function renderChart(data) {
     const x = PAD.left + idx * barW + barW / 2;
     parts.push(
       `<text x="${x.toFixed(2)}" y="${H - 5}" fill="#8a92a5" font-size="10" ` +
-      `text-anchor="middle">${fmtHM(buckets[idx])}</text>`
+      `text-anchor="middle">${fmtTime(buckets[idx], data.window_sec)}</text>`
     );
   }
 
@@ -708,9 +720,9 @@ function renderChart(data) {
 }
 
 async function loadStats() {
-  const win = parseInt($("window-sel").value) || 14400;
+  const win = parseInt($("window-sel").value) || 86400;
   try {
-    const r = await fetch(`/_admin/api/stats?bucket_sec=600&window_sec=${win}`, {cache: "no-store"});
+    const r = await fetch(`/_admin/api/stats?bucket_sec=3600&window_sec=${win}`, {cache: "no-store"});
     const j = await r.json();
     renderChart(j);
   } catch (e) {
@@ -901,8 +913,8 @@ def register_admin(
 
     async def get_stats(request: web.Request) -> web.Response:
         try:
-            bucket_sec = int(request.query.get("bucket_sec", "600"))
-            window_sec = int(request.query.get("window_sec", "14400"))
+            bucket_sec = int(request.query.get("bucket_sec", "3600"))
+            window_sec = int(request.query.get("window_sec", "86400"))
         except ValueError:
             return web.json_response(
                 {"error": "bucket_sec and window_sec must be integers"}, status=400

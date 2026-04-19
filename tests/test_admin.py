@@ -327,9 +327,9 @@ async def test_stats_empty_returns_zero_series(tmp_path: Path):
             async with s.get(f"{url}/_admin/api/stats") as r:
                 assert r.status == 200
                 j = await r.json()
-                assert j["bucket_sec"] == 600
-                assert j["window_sec"] == 14400
-                # 4h / 10min = 24 buckets
+                assert j["bucket_sec"] == 3600
+                assert j["window_sec"] == 86400
+                # 24h / 1h = 24 buckets
                 assert len(j["buckets"]) == 24
                 assert j["series"] == {}
                 assert j["totals"] == {}
@@ -337,8 +337,42 @@ async def test_stats_empty_returns_zero_series(tmp_path: Path):
         await runner.cleanup()
 
 
+def test_stats_bucket_series_deterministic():
+    """Exercise the pure bucketer directly so the test isn't flaky near
+    a real wall-clock bucket boundary."""
+    from claude_api_router.admin import _bucket_series
+
+    # Pin `now` to the MIDDLE of a bucket so subtractions don't
+    # accidentally cross boundaries. End bucket (index n-1) covers
+    # [bucket_start, bucket_start+600); "20 minutes ago" from the middle
+    # then unambiguously lands in bucket n-3.
+    bucket_start = (int(1_700_000_000) // 600) * 600
+    now = float(bucket_start + 300)  # half-way into the current bucket
+
+    log = {
+        "poe":   [now - 10, now - 20, now - 30],     # final bucket ×3
+        "pincc": [now - 1200 + 10],                  # bucket n-3 ×1
+    }
+    buckets, series = _bucket_series(
+        log, bucket_sec=600, window_sec=14400, now=now
+    )
+    assert len(buckets) == 24
+    assert sum(series["poe"]) == 3
+    assert sum(series["pincc"]) == 1
+    assert series["poe"][-1] == 3
+    assert series["pincc"][-3] == 1
+    # Timestamps older than the window are dropped
+    log["poe"].append(now - 20000)
+    _, series = _bucket_series(
+        log, bucket_sec=600, window_sec=14400, now=now
+    )
+    assert sum(series["poe"]) == 3  # still 3, out-of-window one ignored
+
+
 @pytest.mark.asyncio
-async def test_stats_buckets_requests_correctly(tmp_path: Path):
+async def test_stats_endpoint_returns_recorded_requests(tmp_path: Path):
+    """End-to-end: real HTTP request, real time.time(). Only asserts on
+    totals so the test is immune to bucket-boundary races."""
     import time as _t
 
     config_path = tmp_path / "config.toml"
@@ -347,8 +381,6 @@ async def test_stats_buckets_requests_correctly(tmp_path: Path):
     state = State()
 
     now = _t.time()
-    # Place some requests: 3 for poe in the most recent bucket, 1 for
-    # pincc 20 minutes ago (2 buckets back).
     for _ in range(3):
         state.record_request("poe", at=now - 10)
     state.record_request("pincc", at=now - 1200)
@@ -362,10 +394,9 @@ async def test_stats_buckets_requests_correctly(tmp_path: Path):
                 j = await r.json()
                 assert j["totals"]["poe"] == 3
                 assert j["totals"]["pincc"] == 1
-                # Poe count is in the final bucket
-                assert j["series"]["poe"][-1] == 3
-                # Pincc is 2 buckets back from the end
-                assert j["series"]["pincc"][-3] == 1
+                # Both must land *somewhere* in the 4h window.
+                assert sum(j["series"]["poe"]) == 3
+                assert sum(j["series"]["pincc"]) == 1
     finally:
         await runner.cleanup()
 
