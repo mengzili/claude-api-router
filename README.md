@@ -16,13 +16,32 @@ Claude Code ──► router (127.0.0.1:8787) ──► primary upstream
 
 ## Install
 
+Python 3.11+ required.
+
+**Recommended (isolated, on PATH):**
+
 ```bash
-python -m venv .venv
-.venv/Scripts/activate         # or: source .venv/bin/activate
-pip install -e .
+pipx install git+https://github.com/mengzili/claude-api-router
 ```
 
-Python 3.11+ required (uses `tomllib` and `asyncio.timeout`).
+If you don't have pipx: `python -m pip install --user pipx && python -m pipx ensurepath`.
+
+**Or plain pip (installs into your current Python):**
+
+```bash
+pip install git+https://github.com/mengzili/claude-api-router
+```
+
+**For development from a clone:**
+
+```bash
+git clone https://github.com/mengzili/claude-api-router
+cd claude-api-router
+pip install -e '.[dev]'
+```
+
+All three options put the `claude-api-router` binary on your `PATH` so you
+can launch it from any directory.
 
 ## Configure
 

@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 DEFAULT_CONFIG_DIR = Path.home() / ".claude-api-router"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
-DEFAULT_HEALTH_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_HEALTH_MODEL = "claude-opus-4-7"
 
 
 class ApiEntry(BaseModel):

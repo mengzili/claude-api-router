@@ -8,6 +8,12 @@ from typing import Iterable, Literal
 from claude_api_router.config import ApiEntry
 
 
+# Cap per-upstream request log size. ~100k timestamps ≈ 800 KB of floats;
+# at 1 req/sec sustained this covers >24h, which is beyond the default
+# stats window.
+MAX_REQUEST_LOG_PER_UPSTREAM = 100_000
+
+
 HealthStatus = Literal["unknown", "healthy", "slow", "failed", "auth_error"]
 
 
@@ -34,6 +40,18 @@ class State:
     events: deque[Event] = field(default_factory=lambda: deque(maxlen=100))
     active_upstream: str | None = None
     health_paused: bool = False
+    # Per-upstream request timestamps for traffic stats. Upstream names
+    # removed from the config stay here until trimmed so historical bars
+    # stay visible in the timeline.
+    request_log: dict[str, deque[float]] = field(default_factory=dict)
+
+    def record_request(self, name: str, at: float | None = None) -> None:
+        """Record that `name` served a request at `at` (defaults to now)."""
+        dq = self.request_log.get(name)
+        if dq is None:
+            dq = deque(maxlen=MAX_REQUEST_LOG_PER_UPSTREAM)
+            self.request_log[name] = dq
+        dq.append(at if at is not None else time.time())
 
     def ensure(self, entry: ApiEntry) -> UpstreamHealth:
         h = self.health.get(entry.name)

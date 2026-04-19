@@ -179,6 +179,7 @@ def make_app(
                         f"{prev_active} -> {entry.name}",
                     )
                 state.record_success(entry)
+                state.record_request(entry.name)
 
                 resp = web.StreamResponse(
                     status=upstream.status,

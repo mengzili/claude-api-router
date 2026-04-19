@@ -18,6 +18,43 @@ from claude_api_router.state import State
 RESTART_REQUIRED_FIELDS = {"listen_host", "listen_port", "max_buffer_bytes"}
 
 
+def _bucket_series(
+    request_log: dict,
+    *,
+    bucket_sec: int,
+    window_sec: int,
+    now: float,
+) -> tuple[list[int], dict[str, list[int]]]:
+    """Bucket per-upstream request timestamps into fixed-size windows.
+
+    Returns (buckets, series) where `buckets` is a list of bucket-start
+    epoch seconds in ascending order and `series[name]` is the count in
+    each bucket."""
+    if bucket_sec <= 0:
+        bucket_sec = 600
+    # Round `now` down to bucket boundary, then step back `n` buckets.
+    end_bucket = int(now // bucket_sec) * bucket_sec
+    n_buckets = max(1, window_sec // bucket_sec)
+    start_bucket = end_bucket - (n_buckets - 1) * bucket_sec
+    buckets = [start_bucket + i * bucket_sec for i in range(n_buckets)]
+    bucket_index = {b: i for i, b in enumerate(buckets)}
+    earliest = buckets[0]
+
+    series: dict[str, list[int]] = {}
+    for name, stamps in request_log.items():
+        counts = [0] * n_buckets
+        for ts in stamps:
+            if ts < earliest:
+                continue
+            b = int(ts // bucket_sec) * bucket_sec
+            idx = bucket_index.get(b)
+            if idx is not None:
+                counts[idx] += 1
+        if any(counts):
+            series[name] = counts
+    return buckets, series
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -144,6 +181,30 @@ INDEX_HTML = r"""<!doctype html>
          background: #3a2d08; color: var(--warn); margin-left: 6px;
          letter-spacing: 0.02em; text-transform: uppercase; }
   .settings-actions { margin-top: 14px; display: flex; gap: 8px; }
+
+  /* Traffic chart */
+  .chart-head {
+    display: flex; align-items: baseline; gap: 16px;
+    margin-bottom: 10px; font-size: 13px;
+  }
+  .chart-head .window-select {
+    margin-left: auto; color: var(--muted);
+  }
+  .chart-legend {
+    display: flex; flex-wrap: wrap; gap: 14px 20px;
+    margin-top: 10px; font-size: 12px;
+  }
+  .chart-legend .swatch {
+    display: inline-block; width: 10px; height: 10px;
+    border-radius: 2px; margin-right: 6px; vertical-align: baseline;
+  }
+  .chart-legend .name   { color: var(--text); }
+  .chart-legend .count  { color: var(--muted); margin-left: 4px; }
+  .chart-svg {
+    display: block; width: 100%; height: 180px;
+    background: #0c0e13; border: 1px solid var(--border); border-radius: 6px;
+  }
+  .chart-empty { color: var(--muted); padding: 22px; text-align: center; }
 </style>
 </head>
 <body>
@@ -158,7 +219,7 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 <main>
 
-  <details id="howto">
+  <details id="howto" open>
     <summary>How to point Claude Code at this router<span class="sub">environment variable setup</span></summary>
     <div class="panel-body">
       <p class="muted" style="margin-top: 0">
@@ -177,7 +238,30 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </details>
 
-  <details id="settings">
+  <details id="traffic" open>
+    <summary>Traffic<span class="sub" id="traffic-sub">requests per upstream, 10-minute buckets</span></summary>
+    <div class="panel-body">
+      <div class="chart-head">
+        <span id="traffic-total" class="muted"></span>
+        <label class="window-select">
+          window
+          <select id="window-sel">
+            <option value="3600">1 hour</option>
+            <option value="14400" selected>4 hours</option>
+            <option value="43200">12 hours</option>
+            <option value="86400">24 hours</option>
+          </select>
+        </label>
+      </div>
+      <svg id="chart" class="chart-svg" viewBox="0 0 600 180" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="chart-empty" class="chart-empty" style="display:none">
+        No traffic recorded yet. Point Claude Code at this router and send a prompt.
+      </div>
+      <div id="chart-legend" class="chart-legend"></div>
+    </div>
+  </details>
+
+  <details id="settings" open>
     <summary>Settings<span class="sub">ping interval, TTFB timeout, cooldowns, listen address</span></summary>
     <div class="panel-body">
       <div class="settings-grid" id="settings-grid">
@@ -300,11 +384,6 @@ function render() {
   rowsEl.innerHTML = "";
   if (entries.length === 0) {
     $("empty").style.display = "";
-    // If the user hasn't configured anything yet, open the how-to panel.
-    if (!$("howto").hasAttribute("data-auto-opened")) {
-      $("howto").open = true;
-      $("howto").setAttribute("data-auto-opened", "true");
-    }
     return;
   }
   $("empty").style.display = "none";
@@ -515,8 +594,136 @@ async function loadHealth() {
   }
 }
 
+// ---- Traffic chart ---------------------------------------------------
+// Colour palette: first 8 distinct hues, cycled thereafter. Stable by
+// insertion order in the series dict.
+const PALETTE = ["#4f8cff", "#22c55e", "#f59e0b", "#ef4444",
+                 "#a855f7", "#06b6d4", "#ec4899", "#84cc16"];
+let _upstreamColors = {};
+function colorFor(name) {
+  if (_upstreamColors[name]) return _upstreamColors[name];
+  const idx = Object.keys(_upstreamColors).length;
+  _upstreamColors[name] = PALETTE[idx % PALETTE.length];
+  return _upstreamColors[name];
+}
+
+function fmtHM(epochSec) {
+  const d = new Date(epochSec * 1000);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function renderChart(data) {
+  const buckets = data.buckets || [];
+  const series  = data.series  || {};
+  const names   = Object.keys(series);
+  const totals  = data.totals  || {};
+  const grandTotal = Object.values(totals).reduce((a, b) => a + b, 0);
+
+  const chart = $("chart");
+  const empty = $("chart-empty");
+  const legend = $("chart-legend");
+  const total = $("traffic-total");
+  const sub   = $("traffic-sub");
+  const bucketMin = Math.round(data.bucket_sec / 60);
+  const windowH  = (data.window_sec / 3600);
+  sub.textContent = `requests per upstream, ${bucketMin}-minute buckets, last ${windowH}h`;
+
+  if (grandTotal === 0 || names.length === 0) {
+    chart.innerHTML = "";
+    empty.style.display = "";
+    legend.innerHTML = "";
+    total.textContent = "no requests in window";
+    return;
+  }
+  empty.style.display = "none";
+  total.textContent = `${grandTotal} total request${grandTotal === 1 ? "" : "s"}`;
+
+  const W = 600, H = 180;
+  const PAD = { top: 8, right: 8, bottom: 20, left: 28 };
+  const n = buckets.length;
+  const innerW = W - PAD.left - PAD.right;
+  const innerH = H - PAD.top - PAD.bottom;
+  const barW = innerW / Math.max(n, 1);
+
+  // max stacked height per bucket
+  let maxTotal = 0;
+  for (let i = 0; i < n; i++) {
+    let t = 0;
+    for (const name of names) t += series[name][i];
+    if (t > maxTotal) maxTotal = t;
+  }
+  if (maxTotal === 0) maxTotal = 1;
+
+  const parts = [];
+  // Y-axis top label
+  parts.push(`<text x="4" y="${PAD.top + 8}" fill="#8a92a5" font-size="10">${maxTotal}</text>`);
+  // Gridlines
+  parts.push(`<line x1="${PAD.left}" y1="${PAD.top}" x2="${PAD.left}" y2="${PAD.top + innerH}" stroke="#2a2f3a"/>`);
+  parts.push(`<line x1="${PAD.left}" y1="${PAD.top + innerH}" x2="${PAD.left + innerW}" y2="${PAD.top + innerH}" stroke="#2a2f3a"/>`);
+
+  // Stacked bars
+  for (let i = 0; i < n; i++) {
+    let yTop = PAD.top + innerH;
+    let tip = `${fmtHM(buckets[i])}`;
+    for (const name of names) {
+      const v = series[name][i];
+      if (v === 0) continue;
+      const h = (v / maxTotal) * innerH;
+      yTop -= h;
+      const x = PAD.left + i * barW;
+      const w = Math.max(1, barW - 1);
+      tip += `\n${name}: ${v}`;
+      parts.push(
+        `<rect x="${x.toFixed(2)}" y="${yTop.toFixed(2)}" ` +
+        `width="${w.toFixed(2)}" height="${h.toFixed(2)}" ` +
+        `fill="${colorFor(name)}"><title>${esc(tip)}</title></rect>`
+      );
+    }
+  }
+
+  // X-axis time labels: 5 labels spaced across the window.
+  const labelCount = 5;
+  for (let k = 0; k < labelCount; k++) {
+    const idx = Math.round(((n - 1) * k) / (labelCount - 1));
+    const x = PAD.left + idx * barW + barW / 2;
+    parts.push(
+      `<text x="${x.toFixed(2)}" y="${H - 5}" fill="#8a92a5" font-size="10" ` +
+      `text-anchor="middle">${fmtHM(buckets[idx])}</text>`
+    );
+  }
+
+  chart.innerHTML = parts.join("");
+
+  // Legend with per-upstream totals, sorted by descending count.
+  const sortedNames = names.slice().sort((a, b) => (totals[b] || 0) - (totals[a] || 0));
+  legend.innerHTML = sortedNames.map(name => {
+    const c = colorFor(name);
+    const t = totals[name] || 0;
+    return `<span><span class="swatch" style="background:${c}"></span>` +
+           `<span class="name">${esc(name)}</span>` +
+           `<span class="count">(${t})</span></span>`;
+  }).join("");
+}
+
+async function loadStats() {
+  const win = parseInt($("window-sel").value) || 14400;
+  try {
+    const r = await fetch(`/_admin/api/stats?bucket_sec=600&window_sec=${win}`, {cache: "no-store"});
+    const j = await r.json();
+    renderChart(j);
+  } catch (e) {
+    // keep previous chart if endpoint fails
+  }
+}
+
+$("window-sel").addEventListener("change", loadStats);
+
 loadAll();
 setInterval(loadHealth, 2500);
+loadStats();
+setInterval(loadStats, 30000);
 </script>
 </body>
 </html>
@@ -692,6 +899,33 @@ def register_admin(
             }
         )
 
+    async def get_stats(request: web.Request) -> web.Response:
+        try:
+            bucket_sec = int(request.query.get("bucket_sec", "600"))
+            window_sec = int(request.query.get("window_sec", "14400"))
+        except ValueError:
+            return web.json_response(
+                {"error": "bucket_sec and window_sec must be integers"}, status=400
+            )
+        now = time.time()
+        buckets, series = _bucket_series(
+            state.request_log,
+            bucket_sec=bucket_sec,
+            window_sec=window_sec,
+            now=now,
+        )
+        totals = {name: sum(counts) for name, counts in series.items()}
+        return web.json_response(
+            {
+                "now": now,
+                "bucket_sec": bucket_sec,
+                "window_sec": window_sec,
+                "buckets": buckets,
+                "series": series,
+                "totals": totals,
+            }
+        )
+
     async def test_entry(request: web.Request) -> web.Response:
         name = request.match_info["name"]
         entry = cfg.find(name)
@@ -725,4 +959,5 @@ def register_admin(
     app.router.add_get("/_admin/api/settings", get_settings)
     app.router.add_put("/_admin/api/settings", put_settings)
     app.router.add_get("/_admin/api/health", get_health)
+    app.router.add_get("/_admin/api/stats", get_stats)
     app.router.add_post("/_admin/api/test/{name}", test_entry)

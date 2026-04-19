@@ -226,6 +226,27 @@ async def test_all_fail_returns_503():
 
 
 @pytest.mark.asyncio
+async def test_successful_request_is_recorded_in_state():
+    fast_runner, fast_url = await _fake_upstream("fast")
+    try:
+        cfg = _make_cfg([("primary", fast_url, 1)])
+        state = State()
+        pr_runner, pr_url = await _start_proxy(cfg, state)
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(f"{pr_url}/v1/messages", json={}) as r:
+                    assert r.status == 200
+                async with s.post(f"{pr_url}/v1/messages", json={}) as r:
+                    assert r.status == 200
+            assert "primary" in state.request_log
+            assert len(state.request_log["primary"]) == 2
+        finally:
+            await pr_runner.cleanup()
+    finally:
+        await fast_runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_sse_chunks_pass_through():
     chunks = [
         b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
