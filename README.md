@@ -1,17 +1,54 @@
 # claude-api-router
 
-Local proxy that lets Claude Code use a **priority-ordered pool** of
-Anthropic-compatible APIs with automatic health checking and mid-flight
-failover when first-byte latency exceeds 20 s.
+> Local proxy that lets Claude Code draw from a **priority-ordered pool**
+> of Anthropic-compatible APIs. When the current provider stalls or
+> fails, the router quietly switches to the next preferred one — without
+> interrupting the Claude Code session.
+
+## Why this exists
+
+Running Claude Code through any single provider — the official Anthropic
+API, a resale gateway like poe.com, a regional aggregator like pincc —
+is unreliable in practice. Gateways run out of backing accounts,
+rate-limit you, go down for maintenance, or slow to a crawl when
+capacity is tight. The usual fix is to kill your session, edit
+`ANTHROPIC_BASE_URL`, and start over.
+
+**claude-api-router** is a tiny local proxy that holds a
+priority-ordered table of Claude-compatible APIs. Every request from
+Claude Code passes through it; on each request it picks the
+highest-priority healthy upstream. If the upstream stalls for more than
+10 seconds before the first response byte (or returns 5xx / connection
+error), the router transparently retries the next upstream in the same
+HTTP turn — Claude Code sees a single, successful streamed reply.
+Health state is learned from real traffic and refreshed with lightweight
+probes only when a more-preferred upstream is sitting in cooldown, so
+the tool burns zero tokens while idle.
+
+## 为什么需要它
+
+不管你用的是 Anthropic 官方 API、poe 这种第三方网关、还是 pincc
+这种区域聚合代理，单独依赖任何一家都会踩到可用性的坑：后台账号枯竭、
+限流、维护停机、高峰期变慢。传统做法是手动修改
+`ANTHROPIC_BASE_URL` 再重启 Claude Code，体验非常差。
+
+**claude-api-router** 是一个运行在本地的轻量代理，维护一张按优先级
+排序的 Claude-兼容 API 表。Claude Code 的每个请求都从它经过：每次
+选择当前优先级最高且健康的上游；如果 10 秒内没有收到首字节响应
+（或上游返回 5xx / 连接错误），它会在同一个 HTTP 请求里透明地切换
+到下一家上游——Claude Code 只会看到一次完整成功的流式回复。健康
+状态主要从真实请求里学习，只有当更优先的上游仍处于冷却期时才会
+发起轻量探测，所以空闲时零 token 消耗。
 
 ```
 Claude Code ──► router (127.0.0.1:8787) ──► primary upstream
-                         │                       │ (if TTFB > 20s
-                         │                       ▼  or connect fail)
+                         │                       │ (if TTFB > 10s
+                         │                       ▼  or 5xx / connect fail)
                          │                  fallback upstream
                          │
-                         ├─ periodic health pings (minimal /v1/messages)
-                         └─ live TUI dashboard
+                         ├─ upgrade-only probes (fire only when a more
+                         │   preferred upstream is in cooldown)
+                         └─ web admin + live traffic timeline
 ```
 
 ## Install
@@ -147,10 +184,10 @@ log-only output. Ctrl+C exits.
 "First-byte" is used as the latency signal, not "first content-block-
 delta token." For SSE streams the first byte is usually `event:
 message_start` arriving well before actual text. If an upstream stalls
-between headers and the first token, the 20 s watchdog fires after the
-first body chunk is seen. This is simpler than parsing SSE and still
-catches fully-stalled upstreams. Swap in an SSE-aware watchdog if that
-matters.
+between headers and the first token, the `ttfb_timeout` watchdog (10 s
+by default, configurable from the Settings panel) fires after the first
+body chunk is seen. This is simpler than parsing SSE and still catches
+fully-stalled upstreams. Swap in an SSE-aware watchdog if that matters.
 
 ## Commands
 
@@ -172,7 +209,7 @@ claude-api-router test [NAME]      # one-shot health check, print results
 5. Send a prompt, verify streaming works.
 6. To force a TTFB failover, add a `--base-url` pointing at a deliberately
    slow endpoint (`https://httpbin.org/delay/30`) at priority 0 and watch
-   the TUI log the switch around the 20 s mark.
+   the TUI log the switch once `ttfb_timeout` elapses (10 s by default).
 
 ## Development
 
