@@ -9,6 +9,7 @@ description = "Local proxy that routes Claude Code traffic across multiple Anthr
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
+    "brotli>=1.0",   # many gateways (e.g., Cloudflare-fronted) return Content-Encoding: br
     "textual>=0.50",
     "tomli-w>=1.0",
     "typer>=0.12",
