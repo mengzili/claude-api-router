@@ -202,13 +202,29 @@ INDEX_HTML = r"""<!doctype html>
   .chart-legend .name   { color: var(--text); }
   .chart-legend .count  { color: var(--muted); margin-left: 4px; }
   .chart-svg {
-    display: block; width: 100%; height: 180px;
+    display: block; width: 100%; height: 220px;
     background: #0c0e13; border: 1px solid var(--border); border-radius: 6px;
   }
   .chart-empty { color: var(--muted); padding: 22px; text-align: center; }
+  .chart-wrap { position: relative; }
+
+  /* Routing-table drag-to-reorder */
+  tbody tr.drag-source { opacity: 0.5; }
+  tbody tr.drag-over-top    { box-shadow: 0 -2px 0 var(--accent) inset; }
+  tbody tr.drag-over-bottom { box-shadow: 0  2px 0 var(--accent) inset; }
+  .drag-handle {
+    width: 18px; text-align: center; cursor: grab; user-select: none;
+    color: var(--muted); font-size: 14px;
+  }
+  .drag-handle:active { cursor: grabbing; }
+  .priority-cell {
+    text-align: center; color: var(--muted);
+    font-variant-numeric: tabular-nums; font-size: 13px;
+  }
 </style>
 </head>
 <body>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <header>
   <h1>claude-api-router</h1>
   <span class="status" id="status">connecting…</span>
@@ -245,7 +261,8 @@ INDEX_HTML = r"""<!doctype html>
       <table id="tbl">
         <thead>
           <tr>
-            <th style="width:60px">Pri</th>
+            <th style="width:24px"></th>
+            <th style="width:44px">Pri</th>
             <th style="width:18%">Name</th>
             <th style="width:26%">Base URL</th>
             <th style="width:12%">Credential</th>
@@ -288,7 +305,9 @@ INDEX_HTML = r"""<!doctype html>
           </select>
         </label>
       </div>
-      <svg id="chart" class="chart-svg" viewBox="0 0 600 180" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="chart-wrap">
+        <div id="chart" class="chart-svg"></div>
+      </div>
       <div id="chart-empty" class="chart-empty" style="display:none">
         No traffic recorded yet. Point Claude Code at this router and send a prompt.
       </div>
@@ -305,6 +324,7 @@ let activeName = null;
 let settings = {};
 let savedSettings = {};
 let listenUrl = "";
+let chartInstance = null;
 
 const $ = (id) => document.getElementById(id);
 const rowsEl = $("rows");
@@ -386,6 +406,13 @@ function markDirty() {
 
 function render() {
   rowsEl.innerHTML = "";
+  // Priority is derived from the current array order — this is the
+  // single source of truth. Sort once here if the data came in out of
+  // order (e.g. first load), then always renumber on render so the
+  // display and the config stay in sync.
+  entries.sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+  for (let i = 0; i < entries.length; i++) entries[i].priority = i + 1;
+
   if (entries.length === 0) {
     $("empty").style.display = "";
     return;
@@ -393,12 +420,14 @@ function render() {
   $("empty").style.display = "none";
   entries.forEach((e, i) => {
     const tr = document.createElement("tr");
+    tr.draggable = true;
     const credType = e.api_key != null ? "api_key" : "auth_token";
     const secret = e.api_key ?? e.auth_token ?? "";
     const statusCell = (e.name ? statusPill(e.name) : '<span class="muted">(unsaved)</span>')
                      + (activeName === e.name ? ' <span title="currently active">*</span>' : '');
     tr.innerHTML = `
-      <td><input class="priority" type="number" data-k="priority" value="${e.priority ?? 10}"></td>
+      <td class="drag-handle" title="Drag to reorder">⋮⋮</td>
+      <td class="priority-cell">${e.priority}</td>
       <td><input data-k="name" value="${esc(e.name ?? "")}" placeholder="unique name"></td>
       <td><input data-k="base_url" value="${esc(e.base_url ?? "")}" placeholder="https://..."></td>
       <td>
@@ -430,8 +459,7 @@ rowsEl.addEventListener("input", (ev) => {
   const k = ev.target.dataset.k;
   if (!k) return;
   const e = entries[i];
-  if (k === "priority") e.priority = parseInt(ev.target.value) || 0;
-  else if (k === "cred_type") {
+  if (k === "cred_type") {
     const secret = tr.querySelector('[data-k="secret"]').value;
     if (ev.target.value === "api_key")   { e.api_key = secret; e.auth_token = null; }
     else                                 { e.auth_token = secret; e.api_key = null; }
@@ -441,6 +469,64 @@ rowsEl.addEventListener("input", (ev) => {
     else e.auth_token = ev.target.value;
   }
   else e[k] = ev.target.value;
+  markDirty();
+});
+
+// ---- Drag-to-reorder ------------------------------------------------
+let dragFromIdx = null;
+
+rowsEl.addEventListener("dragstart", (ev) => {
+  const tr = ev.target.closest("tr"); if (!tr) return;
+  dragFromIdx = parseInt(tr.dataset.idx);
+  tr.classList.add("drag-source");
+  // Firefox needs some data set on the transfer to actually fire drag events.
+  try { ev.dataTransfer.setData("text/plain", String(dragFromIdx)); } catch {}
+  ev.dataTransfer.effectAllowed = "move";
+});
+
+rowsEl.addEventListener("dragend", (ev) => {
+  const tr = ev.target.closest("tr"); if (tr) tr.classList.remove("drag-source");
+  clearDragOverClasses();
+  dragFromIdx = null;
+});
+
+function clearDragOverClasses() {
+  for (const el of rowsEl.querySelectorAll(".drag-over-top, .drag-over-bottom")) {
+    el.classList.remove("drag-over-top", "drag-over-bottom");
+  }
+}
+
+rowsEl.addEventListener("dragover", (ev) => {
+  if (dragFromIdx === null) return;
+  const tr = ev.target.closest("tr"); if (!tr) return;
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = "move";
+  clearDragOverClasses();
+  const rect = tr.getBoundingClientRect();
+  const above = (ev.clientY - rect.top) < rect.height / 2;
+  tr.classList.add(above ? "drag-over-top" : "drag-over-bottom");
+});
+
+rowsEl.addEventListener("dragleave", (ev) => {
+  // Clear classes only when we leave the tbody entirely, otherwise
+  // moving between rows flickers.
+  if (!rowsEl.contains(ev.relatedTarget)) clearDragOverClasses();
+});
+
+rowsEl.addEventListener("drop", (ev) => {
+  if (dragFromIdx === null) return;
+  const tr = ev.target.closest("tr"); if (!tr) return;
+  ev.preventDefault();
+  const targetIdx = parseInt(tr.dataset.idx);
+  const rect = tr.getBoundingClientRect();
+  const above = (ev.clientY - rect.top) < rect.height / 2;
+  let insertAt = above ? targetIdx : targetIdx + 1;
+  // Pull the source out; fix up the target if it shifted left.
+  const [moved] = entries.splice(dragFromIdx, 1);
+  if (dragFromIdx < insertAt) insertAt -= 1;
+  entries.splice(insertAt, 0, moved);
+  clearDragOverClasses();
+  render();     // render() renumbers priority from the new row order
   markDirty();
 });
 
@@ -471,7 +557,8 @@ rowsEl.addEventListener("click", async (ev) => {
 });
 
 $("add").onclick = () => {
-  entries.push({ name: "", base_url: "", api_key: "", auth_token: null, priority: 10 });
+  // New rows go to the bottom; render() will assign the next priority.
+  entries.push({ name: "", base_url: "", api_key: "", auth_token: null, priority: entries.length + 1 });
   render(); markDirty();
 };
 
@@ -644,73 +731,90 @@ function renderChart(data) {
   sub.textContent = `requests per upstream, ${bucketLabel} buckets, last ${windowLabel}`;
 
   if (grandTotal === 0 || names.length === 0) {
-    chart.innerHTML = "";
+    if (chartInstance) { chartInstance.clear(); }
+    chart.style.visibility = "hidden";
     empty.style.display = "";
     legend.innerHTML = "";
     total.textContent = "no requests in window";
     return;
   }
+  chart.style.visibility = "visible";
   empty.style.display = "none";
   total.textContent = `${grandTotal} total request${grandTotal === 1 ? "" : "s"}`;
 
-  const W = 600, H = 180;
-  const PAD = { top: 8, right: 8, bottom: 20, left: 28 };
-  const n = buckets.length;
-  const innerW = W - PAD.left - PAD.right;
-  const innerH = H - PAD.top - PAD.bottom;
-  const barW = innerW / Math.max(n, 1);
-
-  // max stacked height per bucket
-  let maxTotal = 0;
-  for (let i = 0; i < n; i++) {
-    let t = 0;
-    for (const name of names) t += series[name][i];
-    if (t > maxTotal) maxTotal = t;
-  }
-  if (maxTotal === 0) maxTotal = 1;
-
-  const parts = [];
-  // Y-axis top label
-  parts.push(`<text x="4" y="${PAD.top + 8}" fill="#8a92a5" font-size="10">${maxTotal}</text>`);
-  // Gridlines
-  parts.push(`<line x1="${PAD.left}" y1="${PAD.top}" x2="${PAD.left}" y2="${PAD.top + innerH}" stroke="#2a2f3a"/>`);
-  parts.push(`<line x1="${PAD.left}" y1="${PAD.top + innerH}" x2="${PAD.left + innerW}" y2="${PAD.top + innerH}" stroke="#2a2f3a"/>`);
-
-  // Stacked bars
-  for (let i = 0; i < n; i++) {
-    let yTop = PAD.top + innerH;
-    let tip = `${fmtTime(buckets[i], data.window_sec)}`;
-    for (const name of names) {
-      const v = series[name][i];
-      if (v === 0) continue;
-      const h = (v / maxTotal) * innerH;
-      yTop -= h;
-      const x = PAD.left + i * barW;
-      const w = Math.max(1, barW - 1);
-      tip += `\n${name}: ${v}`;
-      parts.push(
-        `<rect x="${x.toFixed(2)}" y="${yTop.toFixed(2)}" ` +
-        `width="${w.toFixed(2)}" height="${h.toFixed(2)}" ` +
-        `fill="${colorFor(name)}"><title>${esc(tip)}</title></rect>`
-      );
-    }
+  // Initialise ECharts lazily (script is loaded before this code runs).
+  if (!chartInstance) {
+    chartInstance = echarts.init(chart, null, { renderer: "canvas" });
+    window.addEventListener("resize", () => chartInstance && chartInstance.resize());
   }
 
-  // X-axis time labels: 5 labels spaced across the window.
-  const labelCount = 5;
-  for (let k = 0; k < labelCount; k++) {
-    const idx = Math.round(((n - 1) * k) / (labelCount - 1));
-    const x = PAD.left + idx * barW + barW / 2;
-    parts.push(
-      `<text x="${x.toFixed(2)}" y="${H - 5}" fill="#8a92a5" font-size="10" ` +
-      `text-anchor="middle">${fmtTime(buckets[idx], data.window_sec)}</text>`
-    );
-  }
-
-  chart.innerHTML = parts.join("");
-
-  // Legend with per-upstream totals, sorted by descending count.
+  const xLabels = buckets.map(b => fmtTime(b, data.window_sec));
   const sortedNames = names.slice().sort((a, b) => (totals[b] || 0) - (totals[a] || 0));
+
+  const option = {
+    backgroundColor: "transparent",
+    color: sortedNames.map(colorFor),
+    textStyle: { color: "#e6e8ec" },
+    grid: { top: 20, right: 20, bottom: 30, left: 42 },
+    tooltip: {
+      trigger: "axis",
+      axisPointer: {
+        type: "cross",
+        label: { backgroundColor: "#2a2f3a" },
+        lineStyle: { color: "#4f8cff", width: 1 },
+        crossStyle: { color: "#4f8cff" },
+      },
+      backgroundColor: "#0c0e13",
+      borderColor: "#2a2f3a",
+      textStyle: { color: "#e6e8ec", fontSize: 12 },
+      extraCssText: "box-shadow: 0 4px 12px rgba(0,0,0,0.5);",
+      formatter: (params) => {
+        if (!params || !params.length) return "";
+        const time = params[0].axisValueLabel;
+        const rows = params.map(p => {
+          const c = p.color;
+          const v = p.value == null ? 0 : p.value;
+          return `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">
+            <span style="display:inline-block;width:8px;height:8px;background:${c};border-radius:2px"></span>
+            <span>${esc(p.seriesName)}</span>
+            <span style="margin-left:auto;font-weight:500;font-variant-numeric:tabular-nums">${v}</span>
+          </div>`;
+        }).join("");
+        return `<div style="color:#8a92a5;font-size:11px;margin-bottom:6px">${esc(time)}</div>${rows}`;
+      },
+    },
+    xAxis: {
+      type: "category",
+      boundaryGap: false,
+      data: xLabels,
+      axisLine:  { lineStyle: { color: "#2a2f3a" } },
+      axisTick:  { lineStyle: { color: "#2a2f3a" } },
+      axisLabel: { color: "#8a92a5", fontSize: 10 },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      type: "value",
+      minInterval: 1,
+      axisLine:  { lineStyle: { color: "#2a2f3a" } },
+      axisLabel: { color: "#8a92a5", fontSize: 10 },
+      splitLine: { lineStyle: { color: "#1e232e", type: "dashed" } },
+    },
+    series: sortedNames.map(name => ({
+      name,
+      type: "line",
+      smooth: 0.3,
+      showSymbol: false,
+      symbol: "circle",
+      symbolSize: 6,
+      emphasis: { focus: "series", scale: true },
+      lineStyle: { width: 2 },
+      data: series[name],
+    })),
+  };
+
+  // `notMerge: true` so removed upstreams don't ghost in later renders.
+  chartInstance.setOption(option, { notMerge: true });
+
   legend.innerHTML = sortedNames.map(name => {
     const c = colorFor(name);
     const t = totals[name] || 0;

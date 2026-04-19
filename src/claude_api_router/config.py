@@ -61,7 +61,7 @@ class ProxyConfig(BaseModel):
     listen_host: str = "127.0.0.1"
     listen_port: int = 8787
     health_check_interval: float = 60.0
-    ttfb_timeout: float = 20.0
+    ttfb_timeout: float = 10.0
     degraded_cooldown: float = 300.0
     auth_failure_cooldown: float = 1800.0
     health_check_model: str = DEFAULT_HEALTH_MODEL

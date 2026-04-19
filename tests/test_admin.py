@@ -313,7 +313,7 @@ async def test_settings_put_rejects_bogus_value(tmp_path: Path):
             ) as r:
                 assert r.status == 400
         # cfg unchanged
-        assert cfg.proxy.ttfb_timeout == 20.0
+        assert cfg.proxy.ttfb_timeout == 10.0
     finally:
         await runner.cleanup()
 
