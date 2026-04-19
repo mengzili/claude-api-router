@@ -31,9 +31,12 @@ async def _fake_fast():
 
 
 async def _start_proxy_with_admin(
-    cfg: RouterConfig, state: State, config_path: Path
+    cfg: RouterConfig,
+    state: State,
+    config_path: Path,
+    stop_event: asyncio.Event | None = None,
 ):
-    app = make_app(cfg, state, config_path=config_path)
+    app = make_app(cfg, state, config_path=config_path, stop_event=stop_event)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -412,6 +415,42 @@ async def test_stats_rejects_non_integer_params(tmp_path: Path):
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{url}/_admin/api/stats?bucket_sec=abc") as r:
                 assert r.status == 400
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_endpoint_sets_stop_event(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    cfg = RouterConfig(proxy=ProxyConfig(listen_port=0), api=[])
+    config_mod.save(cfg, config_path)
+    state = State()
+    stop = asyncio.Event()
+    runner, url = await _start_proxy_with_admin(cfg, state, config_path, stop)
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{url}/_admin/api/shutdown") as r:
+                assert r.status == 202
+                j = await r.json()
+                assert j["ok"] is True
+        # Endpoint defers ~200ms before setting stop.
+        await asyncio.wait_for(stop.wait(), timeout=2.0)
+        assert stop.is_set()
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_endpoint_errors_without_stop_event(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    cfg = RouterConfig(proxy=ProxyConfig(listen_port=0), api=[])
+    config_mod.save(cfg, config_path)
+    state = State()
+    runner, url = await _start_proxy_with_admin(cfg, state, config_path, None)
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{url}/_admin/api/shutdown") as r:
+                assert r.status == 500
     finally:
         await runner.cleanup()
 

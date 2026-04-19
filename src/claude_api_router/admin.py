@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Any
@@ -770,6 +771,7 @@ def register_admin(
     cfg: RouterConfig,
     state: State,
     config_path: Path,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
     async def index(_request: web.Request) -> web.Response:
         return web.Response(text=INDEX_HTML, content_type="text/html")
@@ -970,6 +972,21 @@ def register_admin(
     app.router.add_put("/_admin/api/config", put_config)
     app.router.add_get("/_admin/api/settings", get_settings)
     app.router.add_put("/_admin/api/settings", put_settings)
+    async def shutdown(_request: web.Request) -> web.Response:
+        if stop_event is None:
+            return web.json_response(
+                {"error": "shutdown not wired (no stop event)"}, status=500
+            )
+        state.log("info", "shutdown requested via admin API")
+        # Respond first, then set the stop event so this request completes
+        # cleanly before the server tears down.
+        async def _defer() -> None:
+            await asyncio.sleep(0.2)
+            stop_event.set()
+        asyncio.create_task(_defer())
+        return web.json_response({"ok": True, "message": "shutting down"}, status=202)
+
     app.router.add_get("/_admin/api/health", get_health)
     app.router.add_get("/_admin/api/stats", get_stats)
     app.router.add_post("/_admin/api/test/{name}", test_entry)
+    app.router.add_post("/_admin/api/shutdown", shutdown)

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import signal
+import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +14,7 @@ import aiohttp
 import typer
 
 from claude_api_router import config as config_mod
+from claude_api_router import daemon as daemon_mod
 from claude_api_router.config import ApiEntry, RouterConfig
 from claude_api_router.health import check_all, run_health_loop
 from claude_api_router.proxy import run_proxy
@@ -45,22 +51,75 @@ def start(
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to config.toml"
     ),
+    foreground: bool = typer.Option(
+        False, "--foreground", "-f",
+        help="Stay attached to this terminal (Ctrl+C to stop).",
+    ),
     tui: bool = typer.Option(
-        False, "--tui", help="Show the Textual dashboard in this terminal."
+        False, "--tui",
+        help="Show the Textual dashboard (implies --foreground).",
     ),
 ) -> None:
-    """Start the proxy in the foreground. Manage config via the Web UI
-    at http://<listen>/_admin. Ctrl+C to stop."""
+    """Start the router in the background. Use `claude-api-router stop`
+    to stop it, or the browser at http://<listen>/_admin to manage it.
+
+    With --foreground (or --tui), stays attached to the current shell
+    so Ctrl+C stops it."""
     config_path = config or config_mod.DEFAULT_CONFIG_PATH
     cfg = config_mod.load_or_empty(config_path)
     if not config_path.exists():
         config_mod.save(cfg, config_path)
+
+    if tui:
+        foreground = True
+
+    # Already running? Refuse the second start.
+    existing = daemon_mod.running_pid()
+    if existing is not None:
+        typer.secho(
+            f"router already running (pid {existing}) at {_listen_url(cfg)}/_admin\n"
+            f"use `claude-api-router stop` first.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if not foreground:
+        # Spawn the same CLI with --foreground so it actually runs the
+        # proxy, and return to the shell.
+        child_argv = [
+            sys.executable, "-m", "claude_api_router", "start",
+            "--foreground", "--config", str(config_path),
+        ]
+        pid = daemon_mod.spawn_detached(child_argv)
+        ok = daemon_mod.wait_for_admin(
+            f"{_listen_url(cfg)}/_admin/api/health", timeout=8.0
+        )
+        if ok:
+            typer.echo(f"router started (pid {pid}) at {_listen_url(cfg)}/_admin")
+            typer.echo(f"logs: {daemon_mod.LOG_FILE}")
+            typer.echo(f"stop: claude-api-router stop")
+        else:
+            typer.secho(
+                f"router started (pid {pid}) but admin did not respond "
+                f"within 8s. Check logs at {daemon_mod.LOG_FILE}.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+        return
+
+    # Foreground: we are the process that actually runs the proxy.
     if not cfg.api:
         typer.secho(
             f"No API entries yet. Open {_listen_url(cfg)}/_admin to add them.",
             fg=typer.colors.YELLOW,
         )
-    asyncio.run(_run_start(cfg, config_path=config_path, show_tui=tui))
+
+    daemon_mod.write_pid(os.getpid())
+    try:
+        asyncio.run(_run_start(cfg, config_path=config_path, show_tui=tui))
+    finally:
+        daemon_mod.clear_pid()
 
 
 async def _run_start(
@@ -79,8 +138,9 @@ async def _run_start(
         loop.add_signal_handler(signal.SIGINT, _sig_handler)
         loop.add_signal_handler(signal.SIGTERM, _sig_handler)
     except NotImplementedError:
-        # Windows ProactorEventLoop: SIGINT still surfaces as
-        # KeyboardInterrupt below, which is enough.
+        # Windows ProactorEventLoop: SIGINT surfaces as KeyboardInterrupt
+        # in the outer try/except; signal-based shutdown via
+        # `claude-api-router stop` goes through the admin endpoint.
         pass
 
     proxy_task = asyncio.create_task(
@@ -91,13 +151,12 @@ async def _run_start(
 
     if show_tui:
         from claude_api_router.tui import run_tui
-
         tui_task = asyncio.create_task(run_tui(cfg, state, stop), name="tui")
         tasks.append(tui_task)
     else:
         listen = _listen_url(cfg)
         typer.echo(f"proxy: {listen}")
-        typer.echo(f"admin: {listen}/_admin  (Ctrl+C to stop)")
+        typer.echo(f"admin: {listen}/_admin")
 
     try:
         await stop.wait()
@@ -110,6 +169,98 @@ async def _run_start(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+@app.command("stop")
+def cmd_stop(
+    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+    timeout: float = typer.Option(
+        10.0, "--timeout", help="Seconds to wait for graceful shutdown."
+    ),
+) -> None:
+    """Stop a running router. Asks it to shut down via the admin
+    endpoint; falls back to a signal/terminate if the endpoint is
+    unreachable."""
+    cfg = config_mod.load_or_empty(config)
+    url = _listen_url(cfg)
+    pid = daemon_mod.running_pid()
+    if pid is None:
+        typer.secho("router is not running", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+
+    graceful = False
+    try:
+        req = urllib.request.Request(
+            f"{url}/_admin/api/shutdown", method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=3) as r:
+            if r.status in (200, 202):
+                graceful = True
+    except urllib.error.URLError as e:
+        typer.secho(
+            f"admin at {url} unreachable ({e}); falling back to signal",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+    if graceful:
+        # Wait for the process to actually exit.
+        import time as _t
+        deadline = _t.time() + timeout
+        while _t.time() < deadline:
+            if not daemon_mod.pid_alive(pid):
+                daemon_mod.clear_pid()
+                typer.echo(f"stopped (pid {pid})")
+                return
+            _t.sleep(0.15)
+        typer.secho(
+            f"graceful shutdown requested but pid {pid} still alive after {timeout:.0f}s",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    # Fallback: terminate the process.
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            PROCESS_TERMINATE = 0x0001
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if not h:
+                raise OSError(f"OpenProcess({pid}) failed")
+            try:
+                if not kernel32.TerminateProcess(h, 1):
+                    raise OSError(f"TerminateProcess({pid}) failed")
+            finally:
+                kernel32.CloseHandle(h)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        daemon_mod.clear_pid()
+        typer.echo(f"terminated (pid {pid})")
+    except OSError as ex:
+        typer.secho(f"terminate failed: {ex}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+
+
+@app.command("status")
+def cmd_status(
+    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Show whether the router is running, and where."""
+    cfg = config_mod.load_or_empty(config)
+    url = _listen_url(cfg)
+    pid = daemon_mod.running_pid()
+    if pid is None:
+        typer.echo("stopped")
+        raise typer.Exit(1)
+    try:
+        with urllib.request.urlopen(f"{url}/_admin/api/health", timeout=2) as r:
+            info = json.loads(r.read().decode("utf-8"))
+        active = info.get("active_upstream") or "-"
+        typer.echo(f"running (pid {pid}) at {url}/_admin  active: {active}")
+    except urllib.error.URLError:
+        typer.echo(f"running (pid {pid}) but admin at {url} is not yet reachable")
+
+
 @app.command("add")
 def cmd_add(
     name: str = typer.Option(..., "--name", "-n"),
@@ -120,7 +271,11 @@ def cmd_add(
     health_model: Optional[str] = typer.Option(None, "--health-model"),
     config: Optional[Path] = typer.Option(None, "--config", "-c"),
 ) -> None:
-    """Add a new API entry to the config."""
+    """Add a new API entry to the config.
+
+    If a router is already running, edits via the Web UI hot-reload;
+    this CLI path only writes the file — restart to pick it up.
+    """
     cfg = config_mod.load_or_empty(config)
     if cfg.find(name) is not None:
         typer.secho(f"entry '{name}' already exists", fg=typer.colors.RED, err=True)
@@ -140,6 +295,12 @@ def cmd_add(
     cfg.api.append(entry)
     path = _save(cfg, config)
     typer.echo(f"added '{name}' (priority {priority}) -> {path}")
+    if daemon_mod.running_pid() is not None:
+        typer.secho(
+            "note: router is running; restart it to pick up this change "
+            "(or use the Web UI which hot-reloads).",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @app.command("remove")
@@ -156,6 +317,11 @@ def cmd_remove(
         raise typer.Exit(1)
     _save(cfg, config)
     typer.echo(f"removed '{name}'")
+    if daemon_mod.running_pid() is not None:
+        typer.secho(
+            "note: router is running; restart it to pick up this change.",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @app.command("list")

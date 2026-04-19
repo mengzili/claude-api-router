@@ -95,6 +95,7 @@ def make_app(
     cfg: RouterConfig,
     state: State,
     config_path: Path | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> web.Application:
     # Session is created lazily per-run and attached via on_startup so it
     # lives on the same loop as the server.
@@ -241,7 +242,7 @@ def make_app(
     # Admin routes must be registered BEFORE the catch-all so they match
     # first. Only attach admin when we have a config path to save back to.
     if config_path is not None:
-        register_admin(app, cfg, state, config_path)
+        register_admin(app, cfg, state, config_path, stop_event=stop_event)
 
     app.router.add_route("*", "/{tail:.*}", handle)
     return app
@@ -253,7 +254,7 @@ async def run_proxy(
     stop: asyncio.Event,
     config_path: Path | None = None,
 ) -> None:
-    app = make_app(cfg, state, config_path=config_path)
+    app = make_app(cfg, state, config_path=config_path, stop_event=stop)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, cfg.proxy.listen_host, cfg.proxy.listen_port)
