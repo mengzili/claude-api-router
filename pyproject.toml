@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-api-router"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local proxy that routes Claude Code traffic across multiple Anthropic-compatible APIs with priority-based failover."
 requires-python = ">=3.11"
 dependencies = [
