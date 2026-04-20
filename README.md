@@ -18,7 +18,7 @@ capacity is tight. The usual fix is to kill your session, edit
 priority-ordered table of Claude-compatible APIs. Every request from
 Claude Code passes through it; on each request it picks the
 highest-priority healthy upstream. If the upstream stalls for more than
-10 seconds before the first response byte (or returns 5xx / connection
+20 seconds before the first response byte (or returns 5xx / connection
 error), the router transparently retries the next upstream in the same
 HTTP turn — Claude Code sees a single, successful streamed reply.
 Health state is learned from real traffic and refreshed with lightweight
@@ -34,7 +34,7 @@ the tool burns zero tokens while idle.
 
 **claude-api-router** 是一个运行在本地的轻量代理，维护一张按优先级
 排序的 Claude-兼容 API 表。Claude Code 的每个请求都从它经过：每次
-选择当前优先级最高且健康的上游；如果 10 秒内没有收到首字节响应
+选择当前优先级最高且健康的上游；如果 20 秒内没有收到首字节响应
 （或上游返回 5xx / 连接错误），它会在同一个 HTTP 请求里透明地切换
 到下一家上游——Claude Code 只会看到一次完整成功的流式回复。健康
 状态主要从真实请求里学习，只有当更优先的上游仍处于冷却期时才会
@@ -42,7 +42,7 @@ the tool burns zero tokens while idle.
 
 ```
 Claude Code ──► router (127.0.0.1:8787) ──► primary upstream
-                         │                       │ (if TTFB > 10s
+                         │                       │ (if TTFB > 20s
                          │                       ▼  or 5xx / connect fail)
                          │                  fallback upstream
                          │
@@ -184,7 +184,7 @@ log-only output. Ctrl+C exits.
 "First-byte" is used as the latency signal, not "first content-block-
 delta token." For SSE streams the first byte is usually `event:
 message_start` arriving well before actual text. If an upstream stalls
-between headers and the first token, the `ttfb_timeout` watchdog (10 s
+between headers and the first token, the `ttfb_timeout` watchdog (20 s
 by default, configurable from the Settings panel) fires after the first
 body chunk is seen. This is simpler than parsing SSE and still catches
 fully-stalled upstreams. Swap in an SSE-aware watchdog if that matters.
@@ -209,7 +209,7 @@ claude-api-router test [NAME]      # one-shot health check, print results
 5. Send a prompt, verify streaming works.
 6. To force a TTFB failover, add a `--base-url` pointing at a deliberately
    slow endpoint (`https://httpbin.org/delay/30`) at priority 0 and watch
-   the TUI log the switch once `ttfb_timeout` elapses (10 s by default).
+   the TUI log the switch once `ttfb_timeout` elapses (20 s by default).
 
 ## Development
 

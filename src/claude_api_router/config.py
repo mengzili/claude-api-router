@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 DEFAULT_CONFIG_DIR = Path.home() / ".claude-api-router"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
-DEFAULT_HEALTH_MODEL = "claude-opus-4-7"
+DEFAULT_HEALTH_MODEL = "claude-opus-4-6"
 
 
 class ApiEntry(BaseModel):
@@ -61,7 +61,7 @@ class ProxyConfig(BaseModel):
     listen_host: str = "127.0.0.1"
     listen_port: int = 8787
     health_check_interval: float = 60.0
-    ttfb_timeout: float = 10.0
+    ttfb_timeout: float = 20.0
     degraded_cooldown: float = 300.0
     auth_failure_cooldown: float = 1800.0
     health_check_model: str = DEFAULT_HEALTH_MODEL
