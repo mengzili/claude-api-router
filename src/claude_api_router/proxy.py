@@ -10,7 +10,7 @@ from aiohttp import web
 
 from claude_api_router import selector
 from claude_api_router.admin import register_admin
-from claude_api_router.config import ApiEntry, RouterConfig
+from claude_api_router.config import ApiEntry, RouterConfig, apply_env_body_overrides
 from claude_api_router.state import State
 
 
@@ -84,6 +84,9 @@ async def _try_upstream(
     """
     url = f"{entry.base_url}{path_qs}"
     headers = _build_upstream_headers(client_headers, entry)
+    # Per-entry env overrides may rewrite the request body (e.g. renaming
+    # the model id for gateways that host under non-canonical names).
+    body = apply_env_body_overrides(body, entry.env)
     cm = session.request(method, url, data=body, headers=headers)
     async with asyncio.timeout(ttfb_timeout):
         upstream = await cm.__aenter__()

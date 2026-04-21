@@ -226,6 +226,58 @@ async def test_all_fail_returns_503():
 
 
 @pytest.mark.asyncio
+async def test_env_override_rewrites_model_id():
+    """The per-entry `env` dict should rewrite the model field in the
+    JSON body the upstream actually receives."""
+    received_bodies = []
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        body = await request.read()
+        received_bodies.append(body)
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    fake_runner = web.AppRunner(app)
+    await fake_runner.setup()
+    fake_site = web.TCPSite(fake_runner, "127.0.0.1", 0)
+    await fake_site.start()
+    fake_port = fake_site._server.sockets[0].getsockname()[1]  # type: ignore[attr-defined]
+    fake_url = f"http://127.0.0.1:{fake_port}"
+
+    try:
+        cfg = RouterConfig(
+            proxy=ProxyConfig(listen_host="127.0.0.1", listen_port=0, ttfb_timeout=1.0),
+            api=[
+                ApiEntry(
+                    name="autodl",
+                    base_url=fake_url,
+                    api_key="k",
+                    priority=1,
+                    env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7-cc"},
+                ),
+            ],
+        )
+        state = State()
+        pr_runner, pr_url = await _start_proxy(cfg, state)
+        try:
+            async with aiohttp.ClientSession() as s:
+                await s.post(
+                    f"{pr_url}/v1/messages",
+                    json={"model": "claude-opus-4-7", "max_tokens": 1,
+                          "messages": [{"role": "user", "content": "hi"}]},
+                )
+            assert len(received_bodies) == 1
+            import json as _json
+            body = _json.loads(received_bodies[0])
+            assert body["model"] == "claude-opus-4-7-cc"
+        finally:
+            await pr_runner.cleanup()
+    finally:
+        await fake_runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_successful_request_is_recorded_in_state():
     fast_runner, fast_url = await _fake_upstream("fast")
     try:

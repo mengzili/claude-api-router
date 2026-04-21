@@ -221,6 +221,21 @@ INDEX_HTML = r"""<!doctype html>
     text-align: center; color: var(--muted);
     font-variant-numeric: tabular-nums; font-size: 13px;
   }
+  /* Expanded detail row (env overrides etc.) */
+  tbody tr.detail-row { background: #0c0e13; }
+  tbody tr.detail-row td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .detail-body { display: grid; gap: 10px; }
+  .detail-body label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+  .detail-body textarea {
+    width: 100%; min-height: 64px; resize: vertical;
+    background: #0c0e13; color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 8px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .detail-body textarea:focus { outline: none; border-color: var(--accent); }
+  .detail-body .hint { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  button.expand-toggle { padding: 4px 6px; font-size: 11px; }
+  button.expand-toggle.on { background: var(--accent); border-color: var(--accent); color: white; }
 </style>
 </head>
 <body>
@@ -404,13 +419,34 @@ function markDirty() {
   setDirty(JSON.stringify(entries) !== JSON.stringify(saved));
 }
 
+// Per-entry expand state; tracked by object identity so it survives
+// drag-reorder (but resets whenever entries are reloaded from the server,
+// which gives you a fresh JS array).
+const expandedEntries = new WeakSet();
+
+function envToText(env) {
+  if (!env) return "";
+  return Object.entries(env).map(([k, v]) => `${k}=${v}`).join("\n");
+}
+function textToEnv(text) {
+  const out = {};
+  for (const line of String(text || "").split("\n")) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    const eq = s.indexOf("=");
+    if (eq <= 0) continue;
+    const k = s.slice(0, eq).trim();
+    const v = s.slice(eq + 1);
+    if (k) out[k] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function render() {
   rowsEl.innerHTML = "";
-  // Priority is derived from the current array order — this is the
-  // single source of truth. Sort once here if the data came in out of
-  // order (e.g. first load), then always renumber on render so the
-  // display and the config stay in sync.
-  entries.sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+  // Priority is derived from the current row order. DON'T sort here —
+  // the array order is authoritative after a drag-drop. loadAll() sorts
+  // by priority once on first fetch; thereafter the array is the truth.
   for (let i = 0; i < entries.length; i++) entries[i].priority = i + 1;
 
   if (entries.length === 0) {
@@ -418,6 +454,7 @@ function render() {
     return;
   }
   $("empty").style.display = "none";
+  const globalProbeModel = (settings && settings.health_check_model) || "";
   entries.forEach((e, i) => {
     const tr = document.createElement("tr");
     tr.draggable = true;
@@ -425,6 +462,9 @@ function render() {
     const secret = e.api_key ?? e.auth_token ?? "";
     const statusCell = (e.name ? statusPill(e.name) : '<span class="muted">(unsaved)</span>')
                      + (activeName === e.name ? ' <span title="currently active">*</span>' : '');
+    const isExpanded = expandedEntries.has(e);
+    const envSummary = e.env && Object.keys(e.env).length
+      ? ` <span class="muted" title="env override active">•</span>` : "";
     tr.innerHTML = `
       <td class="drag-handle" title="Drag to reorder">⋮⋮</td>
       <td class="priority-cell">${e.priority}</td>
@@ -442,14 +482,45 @@ function render() {
           <button data-act="reveal" title="Show/hide">👁</button>
         </div>
       </td>
-      <td>${statusCell}</td>
+      <td>${statusCell}${envSummary}</td>
       <td>
+        <button data-act="expand" class="expand-toggle${isExpanded ? ' on' : ''}" title="Advanced: env overrides, probe model">⚙</button>
         <button data-act="test" title="Send a health ping">Test</button>
         <button data-act="del" class="danger" title="Delete row">×</button>
       </td>
     `;
     tr.dataset.idx = i;
     rowsEl.appendChild(tr);
+
+    if (isExpanded) {
+      const detail = document.createElement("tr");
+      detail.classList.add("detail-row");
+      detail.dataset.idx = i;
+      detail.draggable = false;
+      detail.innerHTML = `
+        <td></td>
+        <td colspan="7">
+          <div class="detail-body">
+            <div>
+              <label>Env overrides &mdash; one <code>KEY=VALUE</code> per line</label>
+              <textarea data-k="env" placeholder="ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7-cc">${esc(envToText(e.env))}</textarea>
+              <div class="hint">
+                Rewrites the outbound request body for this upstream. Supported keys:
+                <code>ANTHROPIC_DEFAULT_OPUS_MODEL</code>,
+                <code>ANTHROPIC_DEFAULT_SONNET_MODEL</code>,
+                <code>ANTHROPIC_DEFAULT_HAIKU_MODEL</code>,
+                <code>ANTHROPIC_MODEL</code>.
+              </div>
+            </div>
+            <div>
+              <label>Probe model (optional)</label>
+              <input type="text" data-k="health_check_model" value="${esc(e.health_check_model ?? "")}" placeholder="defaults to ${esc(globalProbeModel)}">
+            </div>
+          </div>
+        </td>
+      `;
+      rowsEl.appendChild(detail);
+    }
   });
 }
 
@@ -467,6 +538,13 @@ rowsEl.addEventListener("input", (ev) => {
   else if (k === "secret") {
     if (e.api_key != null) e.api_key = ev.target.value;
     else e.auth_token = ev.target.value;
+  }
+  else if (k === "env") {
+    e.env = textToEnv(ev.target.value);
+  }
+  else if (k === "health_check_model") {
+    const v = ev.target.value.trim();
+    e.health_check_model = v || null;
   }
   else e[k] = ev.target.value;
   markDirty();
@@ -498,7 +576,8 @@ function clearDragOverClasses() {
 
 rowsEl.addEventListener("dragover", (ev) => {
   if (dragFromIdx === null) return;
-  const tr = ev.target.closest("tr"); if (!tr) return;
+  const tr = ev.target.closest("tr");
+  if (!tr || tr.classList.contains("detail-row")) return;
   ev.preventDefault();
   ev.dataTransfer.dropEffect = "move";
   clearDragOverClasses();
@@ -515,7 +594,8 @@ rowsEl.addEventListener("dragleave", (ev) => {
 
 rowsEl.addEventListener("drop", (ev) => {
   if (dragFromIdx === null) return;
-  const tr = ev.target.closest("tr"); if (!tr) return;
+  const tr = ev.target.closest("tr");
+  if (!tr || tr.classList.contains("detail-row")) return;
   ev.preventDefault();
   const targetIdx = parseInt(tr.dataset.idx);
   const rect = tr.getBoundingClientRect();
@@ -537,6 +617,11 @@ rowsEl.addEventListener("click", async (ev) => {
   const act = btn.dataset.act;
   if (act === "del") {
     entries.splice(i, 1); render(); markDirty();
+  } else if (act === "expand") {
+    const e = entries[i];
+    if (expandedEntries.has(e)) expandedEntries.delete(e);
+    else expandedEntries.add(e);
+    render();
   } else if (act === "reveal") {
     const inp = tr.querySelector('[data-k="secret"]');
     inp.type = inp.type === "password" ? "text" : "password";
@@ -659,7 +744,11 @@ async function loadAll() {
   const cfg = await cfgResp.json();
   const set = await setResp.json();
   entries = JSON.parse(JSON.stringify(cfg.api));
-  saved   = JSON.parse(JSON.stringify(cfg.api));
+  // Authoritative ordering from server is by priority. Sort once here;
+  // render() and drag-drop handle everything from array order onward.
+  entries.sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+  for (let i = 0; i < entries.length; i++) entries[i].priority = i + 1;
+  saved = JSON.parse(JSON.stringify(entries));
   settings      = JSON.parse(JSON.stringify(set.proxy));
   savedSettings = JSON.parse(JSON.stringify(set.proxy));
   render(); setDirty(false);
@@ -857,6 +946,8 @@ def _entry_to_wire(e: ApiEntry) -> dict[str, Any]:
     }
     if e.health_check_model:
         d["health_check_model"] = e.health_check_model
+    if e.env:
+        d["env"] = dict(e.env)
     return d
 
 
@@ -865,6 +956,14 @@ def _entry_from_wire(raw: dict[str, Any]) -> ApiEntry:
     for k, v in raw.items():
         if isinstance(v, str) and v.strip() == "":
             cleaned[k] = None
+        elif k == "env" and isinstance(v, dict):
+            # Drop blank-valued and blank-keyed entries.
+            kept = {
+                str(kk).strip(): str(vv)
+                for kk, vv in v.items()
+                if str(kk).strip() and str(vv) != ""
+            }
+            cleaned[k] = kept or None
         else:
             cleaned[k] = v
     return ApiEntry.model_validate(cleaned)

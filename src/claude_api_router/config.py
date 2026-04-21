@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tomllib
@@ -22,6 +23,13 @@ class ApiEntry(BaseModel):
     auth_token: str | None = None
     priority: int = 10
     health_check_model: str | None = None
+    # Per-entry Claude-Code-style environment overrides applied to the
+    # outbound request body. Supported keys match the env vars Claude Code
+    # itself reads: ANTHROPIC_DEFAULT_OPUS_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL,
+    # ANTHROPIC_DEFAULT_HAIKU_MODEL, ANTHROPIC_MODEL. Needed for gateways
+    # that serve under non-canonical model names (e.g. autodl's
+    # "claude-opus-4-7-cc").
+    env: dict[str, str] | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -105,7 +113,11 @@ def save(cfg: RouterConfig, path: Path | None = None) -> Path:
     payload: dict = {
         "proxy": cfg.proxy.model_dump(),
         "api": [
-            {k: v for k, v in entry.model_dump().items() if v is not None}
+            {
+                k: v for k, v in entry.model_dump().items()
+                # Drop None and empty {} so the TOML stays clean.
+                if v is not None and v != {}
+            }
             for entry in cfg.api
         ],
     }
@@ -124,3 +136,56 @@ def load_or_empty(path: Path | None = None) -> RouterConfig:
     if not path.exists():
         return RouterConfig()
     return load(path)
+
+
+# ---------------------------------------------------------------------------
+# Per-entry env overrides applied to JSON request bodies before forwarding to
+# upstream. Mirrors the subset of Claude-Code env vars that affect which model
+# id gets sent on the wire.
+# ---------------------------------------------------------------------------
+
+_OPUS_KEY   = "ANTHROPIC_DEFAULT_OPUS_MODEL"
+_SONNET_KEY = "ANTHROPIC_DEFAULT_SONNET_MODEL"
+_HAIKU_KEY  = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+_MODEL_KEY  = "ANTHROPIC_MODEL"
+
+
+def _resolve_model_override(env: dict[str, str], current: str) -> str | None:
+    """Pick the override appropriate to the model family we're sending."""
+    low = current.lower()
+    if "opus" in low:
+        return env.get(_OPUS_KEY) or env.get(_MODEL_KEY)
+    if "sonnet" in low:
+        return env.get(_SONNET_KEY) or env.get(_MODEL_KEY)
+    if "haiku" in low:
+        return env.get(_HAIKU_KEY) or env.get(_MODEL_KEY)
+    return env.get(_MODEL_KEY)
+
+
+def apply_env_body_overrides(body: bytes, env: dict[str, str] | None) -> bytes:
+    """Rewrite the `model` field of a JSON request body per per-entry env.
+
+    No-op when `env` is empty/None, when the body isn't JSON, or when the
+    parsed body doesn't have a string `model` field. Never raises — if
+    anything goes wrong, returns the body unchanged so the proxy keeps
+    working.
+    """
+    if not env:
+        return body
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return body
+    if not isinstance(data, dict):
+        return body
+    current = data.get("model")
+    if not isinstance(current, str):
+        return body
+    override = _resolve_model_override(env, current)
+    if not override or override == current:
+        return body
+    data["model"] = override
+    try:
+        return json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return body

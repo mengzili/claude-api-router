@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 
 import aiohttp
 
-from claude_api_router.config import ApiEntry, RouterConfig
+from claude_api_router.config import ApiEntry, RouterConfig, apply_env_body_overrides
 from claude_api_router.state import State
 
 
@@ -29,13 +30,16 @@ async def ping(
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "hi"}],
     }
+    # Apply per-entry env overrides so the probe uses the same model id
+    # the gateway accepts for real requests.
+    body = apply_env_body_overrides(json.dumps(payload).encode("utf-8"), entry.env)
     url = f"{entry.base_url}/v1/messages"
     t0 = time.monotonic()
     try:
         async with session.post(
             url,
-            json=payload,
-            headers=entry.auth_headers(),
+            data=body,
+            headers={**entry.auth_headers(), "Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=timeout_sec),
         ) as r:
             await r.read()
